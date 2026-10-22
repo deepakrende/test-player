@@ -14,6 +14,38 @@ const MAX_PLAYLIST = 80 * 1024 * 1024;
 const UA = 'VLC/3.0.18 LibVLC/3.0.18';
 const agents = { 'http:': new http.Agent({ keepAlive: true, maxSockets: 200 }), 'https:': new https.Agent({ keepAlive: true, maxSockets: 200 }) };
 const px = u => '/proxy?u=' + encodeURIComponent(u);
+/* ---- diagnostics: everything below only writes to the log, never changes what is streamed ---- */
+const maskUrl = t => { try { const x = new URL(t); return x.host + x.pathname.replace(/\/(live|movie|series|timeshift)\/[^\/]+\/[^\/]+\//i, '/$1/***/***/'); } catch { return '?'; } };
+const STYPE = { 0x01: 'mpeg1-video', 0x02: 'mpeg2-video', 0x03: 'mp2-audio', 0x04: 'mp2-audio', 0x0f: 'aac', 0x11: 'aac-latm', 0x1b: 'h264', 0x24: 'HEVC(h265)', 0x42: 'avs', 0x81: 'ac3', 0x82: 'dts', 0x87: 'eac3', 0x86: 'dts-hd', 0x15: 'metadata' };
+function sniffTS(b) {   // reads the PAT/PMT tables to list the streams (video/audio codecs) inside an MPEG-TS chunk
+  if (!b.length) return 'empty';
+  let o = b.indexOf(0x47); if (o < 0) return 'not MPEG-TS (first bytes: ' + b.slice(0, 16).toString('latin1').replace(/[^\x20-\x7e]/g, '.') + ')';
+  let pmt = -1; const out = [];
+  for (; o + 188 <= b.length; o += 188) {
+    if (b[o] !== 0x47) return 'TS sync lost';
+    const pid = ((b[o + 1] & 0x1f) << 8) | b[o + 2], pusi = b[o + 1] & 0x40, afc = (b[o + 3] >> 4) & 3;
+    if (!pusi || !(afc & 1)) continue;
+    let q = o + 4; if (afc & 2) q += 1 + b[o + 4];
+    const sec = q + 1 + b[q];
+    if (pid === 0 && pmt < 0) { const len = ((b[sec + 1] & 0x0f) << 8) | b[sec + 2]; for (let i = sec + 8; i + 4 <= sec + 3 + len - 4 && i + 4 <= o + 188; i += 4) { const prog = (b[i] << 8) | b[i + 1]; if (prog) { pmt = ((b[i + 2] & 0x1f) << 8) | b[i + 3]; break; } } }
+    else if (pid === pmt && b[sec] === 2) {
+      const len = ((b[sec + 1] & 0x0f) << 8) | b[sec + 2], pil = ((b[sec + 10] & 0x0f) << 8) | b[sec + 11], end = Math.min(sec + 3 + len - 4, o + 188);
+      for (let i = sec + 12 + pil; i + 5 <= end;) {
+        const t = b[i], esl = ((b[i + 3] & 0x0f) << 8) | b[i + 4]; let name = STYPE[t] || ('type 0x' + t.toString(16));
+        if (t === 0x06) { name = 'private'; for (let d = i + 5; d + 2 <= i + 5 + esl; d += 2 + b[d + 1]) { const tag = b[d]; if (tag === 0x6a) name = 'ac3'; else if (tag === 0x7a) name = 'eac3'; else if (tag === 0x7b) name = 'dts'; else if (tag === 0x56) name = 'teletext'; else if (tag === 0x59) name = 'subtitles'; } }
+        out.push(name); i += 5 + esl;
+      }
+      return out.join(' + ') || 'no streams in PMT';
+    }
+  }
+  return pmt < 0 ? 'PAT not found in first chunk' : 'PMT not found in first chunk';
+}
+function sniffStream(r, tag) {   // peeks at the first ~48 KB of a stream and logs the codecs; does not consume or alter the data
+  const ch = []; let n = 0;
+  const f = c => { ch.push(c); n += c.length; if (n >= 49152) { r.removeListener('data', f); console.log('[' + tag + '] codecs: ' + sniffTS(Buffer.concat(ch))); } };
+  r.on('data', f);
+  r.once('close', () => { if (n < 49152) { r.removeListener('data', f); if (n) console.log('[' + tag + '] codecs (short stream, ' + n + ' bytes): ' + sniffTS(Buffer.concat(ch))); } });
+}
 
 const CSP = "default-src 'self'; script-src 'self' 'unsafe-inline' https://cdnjs.cloudflare.com https://cdn.jsdelivr.net; " +
   "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src * data:; media-src 'self' blob:; connect-src 'self'; worker-src 'self' blob:; " +
@@ -82,10 +114,11 @@ async function pumpLive(res, first, target, hd, signal, tx) {
       '-f', 'mpegts', '-muxdelay', '0', '-flush_packets', '1', 'pipe:1'], { stdio: ['pipe', 'pipe', 'pipe'] });
     out = ff.stdin;
     ff.stdin.on('error', () => {});
-    ff.stderr.on('data', d => console.log('[ffmpeg] ' + String(d).trim().slice(0, 200)));
+    ff.stderr.on('data', d => console.log('[ffmpeg] ' + String(d).trim().slice(0, 400)));
+    console.log('[ffmpeg] started audio conversion for ' + maskUrl(target));
     ff.stdout.on('data', c => { if (!res.write(c)) { ff.stdout.pause(); res.once('drain', () => ff.stdout.resume()); } });
     ff.on('error', e => { console.log('[ffmpeg] cannot start: ' + e.message); res.end(); });
-    ff.on('close', () => { if (!res.writableEnded) res.end(); });
+    ff.on('close', (code, sig) => { console.log('[ffmpeg] exited code=' + code + ' signal=' + sig); if (!res.writableEnded) res.end(); });
     res.on('close', () => { try { ff.kill('SIGKILL'); } catch {} });
   }
   const host = (() => { try { return new URL(target).host; } catch { return '?'; } })();
@@ -557,7 +590,7 @@ async function handle(req, res) {
   if (u.pathname === '/logout') { res.writeHead(302, { Location: '/gate', 'Set-Cookie': setCookie(req, 'mmn_session', '', 0), 'Cache-Control': 'no-store' }); return res.end(); }
   let who = null;
   if (gateOn()) {
-    if (u.pathname === '/app' || u.pathname === '/proxy' || u.pathname === '/diag' || u.pathname === '/session') {
+    if (u.pathname === '/app' || u.pathname === '/proxy' || u.pathname === '/diag' || u.pathname === '/session' || u.pathname === '/clog') {
       const m = memberOf(req);
       if (m.error) {
         if (u.pathname === '/app') { res.writeHead(302, { Location: m.error === 'login' ? '/gate' : '/gate?why=' + m.error, 'Cache-Control': 'no-store' }); return res.end(); }
@@ -567,6 +600,16 @@ async function handle(req, res) {
       who = m;
     }
   } else if (!authed(req)) { res.writeHead(401, { ...SEC, 'WWW-Authenticate': 'Basic realm="IPTV Player"' }); return res.end('Password required'); }
+  if (u.pathname === '/clog') {      // player -> server log lines (playback events from the browser), shown in the same log as the server's own
+    if (req.method !== 'POST') return fail(res, 405, 'POST only');
+    const site = req.headers['sec-fetch-site']; if (site && site !== 'same-origin') return fail(res, 403, 'Same-origin requests only');
+    const ip = clientIp(req), now = Date.now(); let h = hits.get('log|' + ip); if (!h || h.reset < now) { h = { n: 0, reset: now + 60000 }; hits.set('log|' + ip, h); }
+    if (++h.n > 240) return fail(res, 429, 'Too many log lines');
+    let o = {}; try { o = JSON.parse(await readBody(req, 6144)); } catch { return fail(res, 400, 'Bad request'); }
+    const line = {}; for (const [k, v] of Object.entries(o).slice(0, 30)) line[String(k).slice(0, 20)] = typeof v === 'string' ? v.replace(/(live|movie|series)\/[^\/\s"]+\/[^\/\s"]+\//g, '$1/***/***/').replace(/(username|password)=[^&\s"]+/g, '$1=***').slice(0, 300) : v;
+    console.log('[client] member=' + (who ? who.entry.name : '-') + ' dev=' + (who && who.device ? who.device.slice(0, 4) : '-') + ' ' + JSON.stringify(line));
+    res.writeHead(204, { ...SEC, 'Cache-Control': 'no-store' }); return res.end();
+  }
   if (u.pathname === '/session') {
     res.writeHead(200, { ...SEC, 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
     return res.end(JSON.stringify(who ? { name: who.entry.name, expires: expOf(who.entry) === Infinity ? null : expOf(who.entry) } : { name: '', expires: null }));
@@ -586,6 +629,10 @@ async function handle(req, res) {
     const meta = { n: String(u.searchParams.get('n') || '').replace(/[\u0000-\u001f]/g, ' ').slice(0, 80), k: ['live', 'movie', 'episode'].includes(u.searchParams.get('k')) ? u.searchParams.get('k') : '' };
     if (u.pathname !== '/proxy' || /player_api\.php/i.test(target) || !meta.k) meta.n = meta.k = '';
     const ac = new AbortController();
+    const rid = crypto.randomBytes(2).toString('hex'), tReq = Date.now(), isList = /player_api\.php/i.test(target), quiet = (() => { try { const q = new URL(target).pathname; return /\.(m3u8?|ts|aac|m4s|mp4)$/i.test(q) && !LIVE_TS.test(q) && u.searchParams.get('tx') !== '1' && /\.(m3u8?|ts|aac|m4s)$/i.test(q); } catch { return false; } })(), logIt = u.pathname === '/proxy' && !isList && !quiet;
+    const who_ = who ? who.entry.name : '-', tag = 'req ' + rid;
+    let upStatus = ''; const b0 = req.socket.bytesWritten;
+    if (logIt) console.log('[' + tag + '] member=' + who_ + ' ch="' + meta.n + '" kind=' + (meta.k || '-') + ' -> ' + maskUrl(target) + (u.searchParams.get('tx') === '1' ? ' (audio conversion ON)' : '') + (req.headers.range ? ' range=' + req.headers.range : ''));
     conc.set(ip, (conc.get(ip) || 0) + 1);
     if (who) { streamInc(who, res); if (meta.n) trackView(who, meta); }
     let lastB = req.socket.bytesWritten, total = 0;
@@ -593,13 +640,18 @@ async function handle(req, res) {
     if (who) METERS.add(sample);
     let done = false;
     const release = () => { if (!done) { done = true; const c = (conc.get(ip) || 1) - 1; c ? conc.set(ip, c) : conc.delete(ip); if (who) { streamDec(who, res); sample(); METERS.delete(sample); if (total >= 1e6) console.log('[usage] member=' + who.entry.name + ' MB=' + (total / 1e6).toFixed(1)); } } };
-    res.on('close', () => { ac.abort(); release(); });
+    res.on('close', () => {
+      if (logIt && upStatus) { const s = (Date.now() - tReq) / 1000, mb = Math.max(0, req.socket.bytesWritten - b0) / 1e6; console.log('[' + tag + '] closed after ' + s.toFixed(1) + 's, sent ~' + mb.toFixed(1) + ' MB' + (s > 3 && mb ? ' (avg ' + Math.round(mb * 8 / s * 1000) + ' kbps)' : '') + ', ' + (res.writableEnded ? 'server finished the response' : 'browser disconnected/aborted')); }
+      ac.abort(); release(); });
     try {
       const hd = { 'User-Agent': UA, Accept: '*/*' };
       if (req.headers.range) hd.Range = req.headers.range;
       const listAct = u.pathname === '/proxy' ? listActionOf(target) : '';
       if (listAct) { const hit = listGet(target); if (hit) return sendList(req, res, hit); }
       const r = await upstream(target, hd, ac.signal);
+      upStatus = String(r.statusCode);
+      if (logIt || (u.pathname === '/proxy' && !isList && r.statusCode >= 400)) console.log('[' + tag + '] member=' + who_ + ' ' + maskUrl(target) + ' provider answered HTTP ' + r.statusCode + ' type=' + (r.headers['content-type'] || '-') + ' length=' + (r.headers['content-length'] || 'none(live)') + ' first-byte=' + (Date.now() - tReq) + 'ms' + (r.finalUrl !== target ? ' redirected to ' + maskUrl(r.finalUrl) : ''));
+      if ((logIt || (u.pathname === '/proxy' && !isList)) && r.statusCode >= 400) { const ch = []; r.on('data', c => { if (ch.length < 2) ch.push(c); }); r.once('close', () => console.log('[' + tag + '] provider error body: ' + Buffer.concat(ch).toString('utf8', 0, 160).replace(/\s+/g, ' ').replace(/(live|movie|series)\/[^\/\s]+\/[^\/\s]+\//g, '$1/***/***/'))); }
       if (u.pathname === '/diag') {
         const chunks = []; let n = 0;
         await new Promise(done => {
@@ -669,9 +721,10 @@ async function handle(req, res) {
       res.writeHead(r.statusCode, out);
       let tp = ''; try { tp = new URL(target).pathname; } catch {}
       const wantTx = u.searchParams.get('tx') === '1';
+      if (logIt && r.statusCode === 200 && /\.(ts|m2ts)$|mp2t|octet|^$/i.test(tp + ' ' + (r.headers['content-type'] || ''))) sniffStream(r, tag);
       if (r.statusCode === 200 && !r.headers['content-length'] && (LIVE_TS.test(tp) || wantTx)) { pumpLive(res, r, target, hd, ac.signal, wantTx); return; }
-      r.on('error', () => res.end()); r.pipe(res);
-    } catch (e) { fail(res, 502, 'Proxy error: ' + e.message); }
+      r.on('error', e => { if (logIt) console.log('[' + tag + '] provider stream error: ' + e.message); res.end(); }); r.pipe(res);
+    } catch (e) { if (u.pathname === '/proxy' && !isList) console.log('[' + tag + '] member=' + who_ + ' ' + maskUrl(target) + ' FAILED to reach provider after ' + (Date.now() - tReq) + 'ms: ' + e.message + (e.code ? ' (' + e.code + ')' : '')); fail(res, 502, 'Proxy error: ' + e.message); }
     return;
   }
 
