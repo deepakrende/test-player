@@ -218,6 +218,9 @@ const px=u=>window.IPTV_PROXY?location.origin+'/proxy?u='+encodeURIComponent(u):
 const v=$('v'),st=$('status'),list=$('list');
 let lastErr='',acct=null,m3u=[],stack=[],mode='',curTab='live',gridMode=false,loadId=0,sess=null,channels=[],view=[],cur=-1,hls=null,mp=null,cush=0,TX=new Set(),limit=300,favs=new Set();
 try{favs=new Set(JSON.parse(localStorage.getItem('iptv_favs')||'[]'))}catch(e){}
+let FIX=new Set();try{FIX=new Set(JSON.parse(localStorage.getItem('iptv_fix')||'[]'))}catch(e){}
+function fixKey(u){const m=String(u).match(/\/(\d+)(?:\.\w+)?(?:\?.*)?$/);return m?m[1]:String(u)}
+function saveFix(){try{localStorage.setItem('iptv_fix',JSON.stringify([...FIX].slice(-200)))}catch(e){}}
 
 function status(msg,kind){st.style.display=msg?'block':'none';st.textContent=msg||'';st.className=/…$/.test(msg||'')?'busy':'';st.style.color=kind==='err'?'var(--err)':''}
 function saveFavs(){try{localStorage.setItem('iptv_favs',JSON.stringify([...favs]))}catch(e){}}
@@ -376,6 +379,7 @@ function playUrl(url,name,vod,meta){
  const modes=guess(url);if(TX.has(url)&&!modes.includes('tstx'))modes.unshift('tstx');
  if(window.IPTV_PROXY&&!vod&&!modes.includes('tstx')&&!/\.(mp4|m4v|webm|mkv|avi|flv)(\?|$)/i.test(url))modes.push('tstx'); /* last resort: server converts audio to AAC */
  if(window.IPTV_PROXY&&!vod&&!modes.includes('tsfix')&&!/\.(mp4|m4v|webm|mkv|avi|flv)(\?|$)/i.test(url))modes.push('tsfix'); /* very last resort: server repairs+re-encodes damaged/interlaced video (needs CPU) */
+ if(window.IPTV_PROXY&&!vod&&FIX.has(fixKey(url))){const i=modes.indexOf('tsfix');if(i>=0)modes.splice(i,1);modes.unshift('tsfix')} /* this channel needed repair before: go straight to it */
  lastErr='';clearInterval(cush);cush=0;v.classList.remove('islive');sess={orig:url,modes,k:0,started:false,fails:0,lastTs:Date.now(),lastT:-1,vod:!!vod,meta:meta||null,resumeAt:0,resumed:false,logged:false,guard:0};
  if(meta&&vod){const h=histGet(url);if(h&&!h.done&&h.t>=15&&h.d-h.t>=30)sess.resumeAt=h.t}
  sess.t0=Date.now();clog('play',{vod:!!vod,modes:modes.join(','),ua:navigator.userAgent.slice(0,110),net:(navigator.connection&&navigator.connection.effectiveType)||''});
@@ -431,7 +435,7 @@ function tryMode(orig,modes,k){
  clog('try_mode',{k,mode:m});
  status('Connecting…');
  const go=()=>{const p=v.play();if(p&&p.catch)p.catch(()=>{})};
-v.onplaying=()=>{if(sess&&!sess.lp){sess.lp=true;clog('playing',{startMs:Date.now()-(sess.t0||Date.now()),res:v.videoWidth+'x'+v.videoHeight})}if(!/^Resumed/.test(st.textContent))status('');if(sess)sess.started=true;onStarted();v.classList.toggle('islive',!!(mp&&sess&&!sess.vod));if(mp&&sess&&!sess.vod&&!sess.cushioned){sess.cushioned=true;cushion(8)}$('live').hidden=!(!isFinite(v.duration)||mp)};v.onwaiting=()=>{dlog('waiting for data');status('Buffering…');if(mp&&sess&&!sess.vod&&sess.started)cushion(4)};
+v.onplaying=()=>{if(sess&&!sess.lp&&sess.modes[sess.k]==='tsfix'&&!FIX.has(fixKey(sess.orig))){FIX.add(fixKey(sess.orig));saveFix()}if(sess&&!sess.lp){sess.lp=true;clog('playing',{startMs:Date.now()-(sess.t0||Date.now()),res:v.videoWidth+'x'+v.videoHeight})}if(!/^Resumed/.test(st.textContent))status('');if(sess)sess.started=true;onStarted();v.classList.toggle('islive',!!(mp&&sess&&!sess.vod));if(mp&&sess&&!sess.vod&&!sess.cushioned){sess.cushioned=true;cushion(8)}$('live').hidden=!(!isFinite(v.duration)||mp)};v.onwaiting=()=>{dlog('waiting for data');status('Buffering…');if(mp&&sess&&!sess.vod&&sess.started)cushion(4)};
  v.ontimeupdate=()=>{if(sess&&v.currentTime!==sess.lastT){sess.lastT=v.currentTime;sess.lastTs=Date.now();sess.fails=0}};
  if(m==='hls'||m==='hlsalt'){
   const hurl=m==='hlsalt'?pm(orig.replace(/\.ts(\?.*)?$/i,'.m3u8')):url;
