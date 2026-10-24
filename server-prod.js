@@ -180,17 +180,21 @@ async function pumpLive(res, first, target, hd, signal, tx) {
   let out = res, ff = null;
   if (tx) {
     const { spawn } = require('child_process');
-    ff = spawn('ffmpeg', ['-hide_banner', '-loglevel', 'warning', '-fflags', '+genpts+discardcorrupt', '-probesize', '1000000', '-analyzeduration', '1500000',
-      '-i', 'pipe:0', '-map', '0:v:0?', '-map', '0:a:0?', '-c:v', 'copy', '-c:a', 'aac', '-b:a', '128k', '-ac', '2',
-      '-f', 'mpegts', '-muxdelay', '0', '-flush_packets', '1', 'pipe:1'], { stdio: ['pipe', 'pipe', 'pipe'] });
+    const common = ['-hide_banner', '-loglevel', 'warning', '-fflags', '+genpts+discardcorrupt', '-probesize', '1000000', '-analyzeduration', '1500000', '-i', 'pipe:0', '-map', '0:v:0?', '-map', '0:a:0?'];
+    const tail = ['-c:a', 'aac', '-b:a', '128k', '-ac', '2', '-f', 'mpegts', '-muxdelay', '0', '-flush_packets', '1', 'pipe:1'];
+    // tx=1: copy video, convert audio.  tx=2 (repair): decode with error concealment, deinterlace, re-encode to <=720p H.264 so a damaged/interlaced source plays in Chrome. Needs real CPU (~0.5 core).
+    const vargs = tx === 2
+      ? ['-vf', "yadif=0:-1:1,scale=-2:'min(720,ih)'", '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'zerolatency', '-profile:v', 'main', '-pix_fmt', 'yuv420p', '-crf', '27', '-maxrate', '3500k', '-bufsize', '3500k', '-g', '50', '-sc_threshold', '0', '-af', 'aresample=async=1:first_pts=0']
+      : ['-c:v', 'copy'];
+    ff = spawn('ffmpeg', [...common, ...vargs, ...tail], { stdio: ['pipe', 'pipe', 'pipe'] });
     out = ff.stdin;
     ff.stdin.on('error', () => {});
-    ff.stderr.on('data', d => console.log('[ffmpeg] ' + String(d).trim().slice(0, 400)));
-    console.log('[ffmpeg] started audio conversion for ' + maskUrl(target));
+    let errLines = 0, errSupp = 0; ff.stderr.on('data', d => { if (errLines < 6) { errLines++; console.log('[ffmpeg] ' + String(d).trim().slice(0, 300)); } else errSupp++; });
+    console.log('[ffmpeg] started ' + (tx === 2 ? 'REPAIR re-encode (deinterlace + 720p)' : 'audio conversion') + ' for ' + maskUrl(target));
     let ffOut = 0; const ffT0 = Date.now();
     ff.stdout.on('data', c => { if (!ffOut) console.log('[ffmpeg] first output after ' + (Date.now() - ffT0) + 'ms'); ffOut += c.length; if (!res.write(c)) { ff.stdout.pause(); res.once('drain', () => ff.stdout.resume()); } });
     ff.on('error', e => { console.log('[ffmpeg] cannot start: ' + e.message); res.end(); });
-    ff.on('close', (code, sig) => { console.log('[ffmpeg] exited code=' + code + ' signal=' + sig + ' output=' + Math.round(ffOut / 1024) + ' KB'); if (!res.writableEnded) res.end(); });
+    ff.on('close', (code, sig) => { console.log('[ffmpeg] exited code=' + code + ' signal=' + sig + ' output=' + Math.round(ffOut / 1024) + ' KB' + (errSupp ? ' (' + errSupp + ' more warning chunks hidden: source stream is damaged)' : '')); if (!res.writableEnded) res.end(); });
     res.on('close', () => { try { ff.kill('SIGKILL'); } catch {} });
   }
   const host = (() => { try { return new URL(target).host; } catch { return '?'; } })();
@@ -713,7 +717,7 @@ async function handle(req, res) {
     const rid = crypto.randomBytes(2).toString('hex'), tReq = Date.now(), isList = /player_api\.php/i.test(target), quiet = (() => { try { const q = new URL(target).pathname; return /\.(m3u8?|ts|aac|m4s|mp4)$/i.test(q) && !LIVE_TS.test(q) && u.searchParams.get('tx') !== '1' && /\.(m3u8?|ts|aac|m4s)$/i.test(q); } catch { return false; } })(), logIt = u.pathname === '/proxy' && !isList && !quiet;
     const who_ = who ? who.entry.name : '-', tag = 'req ' + rid;
     let upStatus = ''; const b0 = req.socket.bytesWritten;
-    if (logIt) console.log('[' + tag + '] member=' + who_ + ' ch="' + meta.n + '" kind=' + (meta.k || '-') + ' -> ' + maskUrl(target) + (u.searchParams.get('tx') === '1' ? ' (audio conversion ON)' : '') + (req.headers.range ? ' range=' + req.headers.range : ''));
+    if (logIt) console.log('[' + tag + '] member=' + who_ + ' ch="' + meta.n + '" kind=' + (meta.k || '-') + ' -> ' + maskUrl(target) + (u.searchParams.get('tx') === '2' ? ' (REPAIR re-encode ON)' : u.searchParams.get('tx') === '1' ? ' (audio conversion ON)' : '') + (req.headers.range ? ' range=' + req.headers.range : ''));
     conc.set(ip, (conc.get(ip) || 0) + 1);
     if (who) { streamInc(who, res); if (meta.n) trackView(who, meta); }
     let lastB = req.socket.bytesWritten, total = 0;
@@ -811,7 +815,7 @@ async function handle(req, res) {
       for (const k of ['content-type', 'content-length', 'content-range', 'accept-ranges']) if (r.headers[k]) out[k] = r.headers[k];
       res.writeHead(r.statusCode, out);
       let tp = ''; try { tp = new URL(target).pathname; } catch {}
-      const wantTx = u.searchParams.get('tx') === '1';
+      const wantTx = u.searchParams.get('tx') === '2' ? 2 : u.searchParams.get('tx') === '1' ? 1 : 0;
       if (logIt && r.statusCode === 200 && /\.(ts|m2ts)$|mp2t|octet|^$/i.test(tp + ' ' + (r.headers['content-type'] || ''))) sniffStream(r, tag);
       if (r.statusCode === 200 && !r.headers['content-length'] && (LIVE_TS.test(tp) || wantTx)) { pumpLive(res, r, target, hd, ac.signal, wantTx); return; }
       r.on('error', e => { if (logIt) console.log('[' + tag + '] provider stream error: ' + e.message); res.end(); }); r.pipe(res);
