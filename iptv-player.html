@@ -417,6 +417,7 @@ function tryMode(orig,modes,k){
  const tok=++modeTok;
  const libThen=(n,fn)=>ensureLib(n).then(()=>{if(tok===modeTok)fn()}).catch(()=>{if(tok===modeTok){lastErr=(lastErr?lastErr+' | ':'')+'could not load the '+n+' library';next()}});
  if(k>=modes.length){
+  if(sess)sess.dead=true;
   clog('ALL_MODES_FAILED',{tried:modes.join(','),lastErr:lastErr.slice(0,250)});
   if(window.IPTV_PROXY){status('Checking why this stream failed…');diagnose(orig).then(m=>{clog('diagnosis',{m:m.slice(0,280)});if(sess&&sess.orig===orig)status(m,'err')});}
   else{const mixed=location.protocol==='https:'&&orig.startsWith('http:');
@@ -474,7 +475,7 @@ function clog(ev,d){if(!window.IPTV_PROXY||++clogN>3000)return;
   fetch('/clog',{method:'POST',keepalive:true,headers:{'Content-Type':'application/json'},body:JSON.stringify(o)}).catch(()=>{})}catch(e){}}
 function dlog(m){dl.push(new Date().toLocaleTimeString()+' '+m);if(dl.length>8)dl.shift();if(/^waiting/.test(m)){if(Date.now()-lastWaitLog<3000)return;lastWaitLog=Date.now();m+=' (buffer ahead '+aheadOf().toFixed(1)+'s, download '+dspeed+' KB/s)'}clog('note',{m})}
 addEventListener('error',e=>clog('js_error',{m:String(e.message||'').slice(0,200)}));
-v.addEventListener('error',()=>{const e=v.error;clog('video_element_error',{code:e&&e.code,m:e&&e.message})});
+v.addEventListener('error',()=>{const e=v.error;clog('video_element_error',{code:e&&e.code,m:e&&e.message});if(sess&&!sess.started&&!sess.dead&&e&&(e.code===3||e.code===4)){const s0=sess,k0=s0.k;setTimeout(()=>{if(sess===s0&&!s0.started&&!s0.dead&&s0.k===k0)tryMode(s0.orig,s0.modes,k0+1)},300)}});
 setInterval(()=>{if(!sess||!sess.started||v.paused)return;let q={};try{q=v.getVideoPlaybackQuality()}catch(e){}
  clog('stats',{ahead:+aheadOf().toFixed(1),kbs:dspeed,dropped:q.droppedVideoFrames,frames:q.totalVideoFrames,res:v.videoWidth+'x'+v.videoHeight,t:Math.round(v.currentTime)})},10000);
 if(DBG){$('dbg').hidden=false;setInterval(()=>{let a=0;try{const b=v.buffered;if(b.length)a=b.end(b.length-1)-v.currentTime}catch(e){}
@@ -520,7 +521,7 @@ $('vlc').onclick=async()=>{
  catch(e){prompt('Copy this link. In VLC press Ctrl+N, paste it and click Play:',u)}
 };
 setInterval(()=>{ /* watchdog: never-started streams advance to the next mode; frozen picture reconnects */
- if(!sess||sess.vod)return;
+ if(!sess||sess.vod||sess.dead)return;
  if(!sess.started){const mm=sess.modes[sess.k]||'';if(Date.now()-sess.lastTs>(/^(ts|tsalt|flv|tstx)$/.test(mm)?30000:12000)){clog('never_started_giving_up_mode',{mode:mm,waitedMs:Date.now()-sess.lastTs,lastErr:lastErr.slice(0,200)});tryMode(sess.orig,sess.modes,sess.k+1);}return}
  if(v.paused||v.seeking)return;
  if(Date.now()-sess.lastTs>10000)reconnect('stalled');
