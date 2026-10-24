@@ -375,6 +375,7 @@ function playUrl(url,name,vod,meta){
  $('title').textContent=name;$('sub').textContent='Direct stream';$('nlogo').innerHTML='';$('nlogo').dataset.ini='▶';$('live').hidden=true;$('welcome').hidden=true;document.title=name+' · MMN';
  const modes=guess(url);if(TX.has(url)&&!modes.includes('tstx'))modes.unshift('tstx');
  if(window.IPTV_PROXY&&!vod&&!modes.includes('tstx')&&!/\.(mp4|m4v|webm|mkv|avi|flv)(\?|$)/i.test(url))modes.push('tstx'); /* last resort: server converts audio to AAC */
+ if(window.IPTV_PROXY&&!vod&&!modes.includes('tsfix')&&!/\.(mp4|m4v|webm|mkv|avi|flv)(\?|$)/i.test(url))modes.push('tsfix'); /* very last resort: server repairs+re-encodes damaged/interlaced video (needs CPU) */
  lastErr='';clearInterval(cush);cush=0;v.classList.remove('islive');sess={orig:url,modes,k:0,started:false,fails:0,lastTs:Date.now(),lastT:-1,vod:!!vod,meta:meta||null,resumeAt:0,resumed:false,logged:false,guard:0};
  if(meta&&vod){const h=histGet(url);if(h&&!h.done&&h.t>=15&&h.d-h.t>=30)sess.resumeAt=h.t}
  sess.t0=Date.now();clog('play',{vod:!!vod,modes:modes.join(','),ua:navigator.userAgent.slice(0,110),net:(navigator.connection&&navigator.connection.effectiveType)||''});
@@ -451,8 +452,8 @@ v.onplaying=()=>{if(sess&&!sess.lp){sess.lp=true;clog('playing',{startMs:Date.no
   }else next()});
  }else if(m==='native'){
   if(v.canPlayType('application/vnd.apple.mpegurl')){v.src=url;v.onerror=bad;go()}else next();
- }else if(m==='ts'||m==='flv'||m==='tsalt'||m==='tstx'){
-  const turl=m==='tsalt'?pm(orig.replace(/\.m3u8(\?.*)?$/i,'.ts')):m==='tstx'?pm(/\.m3u8(\?.*)?$/i.test(orig)?orig.replace(/\.m3u8(\?.*)?$/i,'.ts'):orig)+'&tx=1':url;
+ }else if(m==='ts'||m==='flv'||m==='tsalt'||m==='tstx'||m==='tsfix'){
+  const turl=m==='tsalt'?pm(orig.replace(/\.m3u8(\?.*)?$/i,'.ts')):(m==='tstx'||m==='tsfix')?pm(/\.m3u8(\?.*)?$/i.test(orig)?orig.replace(/\.m3u8(\?.*)?$/i,'.ts'):orig)+(m==='tsfix'?'&tx=2':'&tx=1'):url;
   libThen('mpegts',()=>{if(window.mpegts&&mpegts.isSupported()){
    mp=mpegts.createPlayer({type:m==='flv'?'flv':'mpegts',isLive:true,url:turl},{enableWorker:true,enableStashBuffer:true,stashInitialSize:393216,liveBufferLatencyChasing:false,autoCleanupSourceBuffer:true,autoCleanupMaxBackwardDuration:40,autoCleanupMinBackwardDuration:20,reuseRedirectedURL:true});
    mp.attachMediaElement(v);mp.load();
@@ -522,7 +523,7 @@ $('vlc').onclick=async()=>{
 };
 setInterval(()=>{ /* watchdog: never-started streams advance to the next mode; frozen picture reconnects */
  if(!sess||sess.vod||sess.dead)return;
- if(!sess.started){const mm=sess.modes[sess.k]||'';if(Date.now()-sess.lastTs>(/^(ts|tsalt|flv|tstx)$/.test(mm)?30000:12000)){clog('never_started_giving_up_mode',{mode:mm,waitedMs:Date.now()-sess.lastTs,lastErr:lastErr.slice(0,200)});tryMode(sess.orig,sess.modes,sess.k+1);}return}
+ if(!sess.started){const mm=sess.modes[sess.k]||'';if(Date.now()-sess.lastTs>(/^(ts|tsalt|flv|tstx|tsfix)$/.test(mm)?30000:12000)){clog('never_started_giving_up_mode',{mode:mm,waitedMs:Date.now()-sess.lastTs,lastErr:lastErr.slice(0,200)});tryMode(sess.orig,sess.modes,sess.k+1);}return}
  if(v.paused||v.seeking)return;
  if(Date.now()-sess.lastTs>10000)reconnect('stalled');
 },2000);
