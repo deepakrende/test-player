@@ -112,11 +112,27 @@ const GATE_MAX_SKIP = 12 * 1024 * 1024;
 class TsGate {
   constructor() { this.reset(); }
   reset() { this.open = false; this.vpid = -1; this.pmtPid = -1; this.pat = null; this.pmt = null; this.held = []; this.parts = []; this.skipped = 0; this.reason = ''; }
-  static hasIdr(buf) {
-    for (let i = 0; i + 3 < buf.length; i++) {
-      if (buf[i] === 0 && buf[i + 1] === 0 && buf[i + 2] === 1) { if ((buf[i + 3] & 0x1f) === 5) return true; i += 2; }
+  /* what this video PES contains: IDR slice, SPS, and a recovery-point SEI (payload type 6) */
+  static scan(buf) {
+    const r = { idr: false, sps: false, rp: false };
+    for (let i = 0; i + 4 < buf.length; i++) {
+      if (buf[i] === 0 && buf[i + 1] === 0 && buf[i + 2] === 1) {
+        const t = buf[i + 3] & 0x1f;
+        if (t === 5) r.idr = true;
+        else if (t === 7) r.sps = true;
+        else if (t === 6) {                       // SEI: walk its messages looking for payloadType 6
+          let j = i + 4;
+          for (let m = 0; m < 8 && j + 2 < buf.length; m++) {
+            let pt = 0; while (buf[j] === 0xff && j < buf.length) { pt += 255; j++; } pt += buf[j++];
+            let sz = 0; while (buf[j] === 0xff && j < buf.length) { sz += 255; j++; } sz += buf[j++];
+            if (pt === 6) { r.rp = true; break; }
+            j += sz; if (buf[j] === 0x80 || (buf[j] === 0 && buf[j + 1] === 0)) break;
+          }
+        }
+        i += 2;
+      }
     }
-    return false;
+    return r;
   }
   feed(chunk) {
     if (this.open) return chunk;
@@ -134,9 +150,16 @@ class TsGate {
       } else if (pid === this.pmtPid && pusi) this.pmt = Buffer.from(p);
       if (this.vpid < 0 && pusi && pl.length > 3 && pl[0] === 0 && pl[1] === 0 && pl[2] === 1 && (pl[3] & 0xf0) === 0xe0) this.vpid = pid;
       if (pid === this.vpid && pusi) {
-        const ok = this.held.length && (TsGate.hasIdr(Buffer.concat(this.parts)) || (this.reason = this.skipped > GATE_MAX_SKIP ? 'no IDR, forced' : ''));
+        let ok = false;
+        if (this.held.length) {
+          const f = TsGate.scan(Buffer.concat(this.parts));
+          if (f.idr) { ok = true; this.reason = 'IDR'; }
+          else if (f.sps && f.rp) { ok = true; this.reason = 'recovery point'; }
+          else if (f.sps && this.skipped > GATE_MAX_SKIP) { ok = true; this.reason = 'no IDR/recovery, SPS only'; }
+          else if (this.skipped > GATE_MAX_SKIP * 4) { ok = true; this.reason = 'forced'; }
+        }
         if (ok) {
-          this.open = true; this.reason = this.reason || 'IDR';
+          this.open = true;
           if (this.pat) out.push(this.pat); if (this.pmt) out.push(this.pmt);
           for (const h of this.held) out.push(h); out.push(Buffer.from(p));
           this.held = []; this.parts = []; next = o + 188;
@@ -174,18 +197,23 @@ async function pumpLive(res, first, target, hd, signal, tx) {
   const headers = { ...hd }; delete headers.Range;
   let r = first, quick = 0, reconnects = 0, lastUrl = first.finalUrl, cachedOk = true, usedCached = false, lastMs = 0;
   const gate = new TsGate(); let wasOpen = false;
+  const st = { inB: 0, outB: 0, pausedMs: 0, ps: 0, t: Date.now() };
+  const tick = setInterval(() => { const dt = (Date.now() - st.t) / 1000; if (st.ps) { st.pausedMs += Date.now() - st.ps; st.ps = Date.now(); }
+    console.log('[live] ' + dt.toFixed(0) + 's: provider->server ' + Math.round(st.inB / 1024 / dt) + ' KB/s, server->browser ' + Math.round(st.outB / 1024 / dt) + ' KB/s, waiting on browser ' + Math.round(st.pausedMs / 10 / dt) + '%');
+    st.inB = st.outB = st.pausedMs = 0; st.t = Date.now(); }, 10000);
+  res.once('close', () => clearInterval(tick));
   for (;;) {
     gate.reset(); wasOpen = false;
     const t0 = Date.now(); let got = 0, carry = Buffer.alloc(0), why = 'end';
     await new Promise(resolve => {
       r.on('data', c => {
-        got += c.length;
+        got += c.length; st.inB += c.length;
         const buf = carry.length ? Buffer.concat([carry, c]) : c;
         const n = buf.length - (buf.length % 188);
         carry = buf.subarray(n);
         const piece = n ? (IDR_GATE ? gate.feed(buf.subarray(0, n)) : buf.subarray(0, n)) : null;
         if (IDR_GATE && !wasOpen && gate.open) { wasOpen = true; console.log('[live] started on keyframe (' + gate.reason + '), skipped ' + Math.round(gate.skipped / 1024) + ' KB'); }
-        if (piece && piece.length && !out.write(piece)) { r.pause(); out.once('drain', () => r.resume()); }
+        if (piece && piece.length) { st.outB += piece.length; if (!out.write(piece)) { r.pause(); if (!st.ps) st.ps = Date.now(); out.once('drain', () => { if (st.ps) { st.pausedMs += Date.now() - st.ps; st.ps = 0; } r.resume(); }); } }
       });
       r.on('end', resolve);
       r.on('error', e => { why = 'error: ' + e.message; resolve(); });
@@ -701,7 +729,7 @@ async function handle(req, res) {
       if (req.headers.range) hd.Range = req.headers.range;
       const listAct = u.pathname === '/proxy' ? listActionOf(target) : '';
       if (listAct) { const hit = listGet(target); if (hit) return sendList(req, res, hit); }
-      const r = await upstream(target, hd, ac.signal);
+      let r = await upstream(target, hd, ac.signal);
       upStatus = String(r.statusCode);
       if (logIt || (u.pathname === '/proxy' && !isList && r.statusCode >= 400)) console.log('[' + tag + '] member=' + who_ + ' ' + maskUrl(target) + ' provider answered HTTP ' + r.statusCode + ' type=' + (r.headers['content-type'] || '-') + ' length=' + (r.headers['content-length'] || 'none(live)') + ' first-byte=' + (Date.now() - tReq) + 'ms' + (r.finalUrl !== target ? ' redirected to ' + maskUrl(r.finalUrl) : ''));
       if ((logIt || (u.pathname === '/proxy' && !isList)) && r.statusCode >= 400) { const ch = []; r.on('data', c => { if (ch.length < 2) ch.push(c); }); r.once('close', () => console.log('[' + tag + '] provider error body: ' + Buffer.concat(ch).toString('utf8', 0, 160).replace(/\s+/g, ' ').replace(/(live|movie|series)\/[^\/\s]+\/[^\/\s]+\//g, '$1/***/***/'))); }
@@ -719,6 +747,16 @@ async function handle(req, res) {
         const snippet = /HTML|M3U|unknown/.test(kind) ? mask(b.toString('utf8', 0, 200)) : '';
         res.writeHead(200, { ...SEC, 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
         return res.end(JSON.stringify({ status: r.statusCode, type: r.headers['content-type'] || '', kind, bytes: b.length, host: new URL(r.finalUrl).host, redirected: r.finalUrl !== target, snippet }));
+      }
+      { // live .ts that answers with an HTML page = provider busy / channel offline. The previous connection is often
+        // still being released after a channel switch, so retry a few times before giving up.
+        let tp0 = ''; try { tp0 = new URL(target).pathname; } catch {}
+        for (let tries = 0; tries < 3 && LIVE_TS.test(tp0) && r.statusCode === 200 && /^text\/html/i.test(r.headers['content-type'] || ''); tries++) {
+          r.destroy(); if (logIt) console.log('[' + tag + '] provider sent a web page instead of video (busy/offline?), retry ' + (tries + 1) + '/3');
+          await sleep(1500); if (ac.signal.aborted) return;
+          r = await upstream(target, hd, ac.signal); upStatus = String(r.statusCode);
+        }
+        if (LIVE_TS.test(tp0) && r.statusCode === 200 && /^text\/html/i.test(r.headers['content-type'] || '')) { r.destroy(); return fail(res, 503, 'Provider returned a web page instead of video: the channel is offline or your provider connection limit is reached'); }
       }
       const ct = r.headers['content-type'] || '';
       if (listAct && r.statusCode === 200 && !r.headers['content-encoding'] && /json|text/i.test(ct)) {
