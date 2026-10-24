@@ -523,7 +523,7 @@ $('vlc').onclick=async()=>{
 };
 setInterval(()=>{ /* watchdog: never-started streams advance to the next mode; frozen picture reconnects */
  if(!sess||sess.vod||sess.dead)return;
- if(!sess.started){const mm=sess.modes[sess.k]||'';if(Date.now()-sess.lastTs>(/^(ts|tsalt|flv|tstx|tsfix)$/.test(mm)?30000:12000)){clog('never_started_giving_up_mode',{mode:mm,waitedMs:Date.now()-sess.lastTs,lastErr:lastErr.slice(0,200)});tryMode(sess.orig,sess.modes,sess.k+1);}return}
+ if(!sess.started){const mm=sess.modes[sess.k]||'';if(Date.now()-sess.lastTs>(/^(tstx|tsfix)$/.test(mm)?30000:/^(ts|tsalt|flv)$/.test(mm)?15000:12000)){clog('never_started_giving_up_mode',{mode:mm,waitedMs:Date.now()-sess.lastTs,lastErr:lastErr.slice(0,200)});tryMode(sess.orig,sess.modes,sess.k+1);}return}
  if(v.paused||v.seeking)return;
  if(Date.now()-sess.lastTs>10000)reconnect('stalled');
 },2000);
