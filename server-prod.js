@@ -101,6 +101,54 @@ function upstream(target, headers, signal, hops = 0) {
    Some Xtream panels close a live .ts connection every ~30s. Instead of letting the browser see the
    break (and freeze while it reconnects), reconnect to the provider here and keep feeding the SAME
    response to the browser, cutting only on whole 188-byte TS packets so the stream stays valid. */
+
+/* ---- start-on-keyframe gate ----
+   A live .ts joined in the middle of a GOP (first connect, and every reconnect) starts with P/B frames whose reference
+   frames are missing. VLC hides that, Chrome's decoder aborts with PIPELINE_ERROR_DECODE. This drops everything until the
+   first H.264 IDR picture, then re-sends PAT+PMT in front of it so the stream is valid from byte 0.
+   If no IDR shows up within GATE_MAX_SKIP bytes (intra-refresh streams), it opens on the next video PES anyway. */
+const IDR_GATE = process.env.IDR_GATE !== '0';
+const GATE_MAX_SKIP = 12 * 1024 * 1024;
+class TsGate {
+  constructor() { this.reset(); }
+  reset() { this.open = false; this.vpid = -1; this.pmtPid = -1; this.pat = null; this.pmt = null; this.held = []; this.parts = []; this.skipped = 0; this.reason = ''; }
+  static hasIdr(buf) {
+    for (let i = 0; i + 3 < buf.length; i++) {
+      if (buf[i] === 0 && buf[i + 1] === 0 && buf[i + 2] === 1) { if ((buf[i + 3] & 0x1f) === 5) return true; i += 2; }
+    }
+    return false;
+  }
+  feed(chunk) {
+    if (this.open) return chunk;
+    const out = []; let next = -1;
+    for (let o = 0; o + 188 <= chunk.length && !this.open; o += 188) {
+      const p = chunk.subarray(o, o + 188);
+      if (p[0] !== 0x47) continue;
+      const pid = ((p[1] & 0x1f) << 8) | p[2], pusi = !!(p[1] & 0x40), afc = (p[3] >> 4) & 3;
+      let off = 4; if (afc & 2) off += 1 + p[4];
+      const pl = (afc & 1) && off < 188 ? p.subarray(off) : Buffer.alloc(0);
+      if (pid === 0 && pusi && pl.length > 12) {
+        this.pat = Buffer.from(p);
+        const sec = pl.subarray(1 + pl[0]), end = 3 + (((sec[1] & 0xf) << 8) | sec[2]) - 4;
+        for (let i = 8; i + 4 <= end && i + 4 <= sec.length; i += 4) { if ((sec[i] << 8 | sec[i + 1]) !== 0) { this.pmtPid = ((sec[i + 2] & 0x1f) << 8) | sec[i + 3]; break; } }
+      } else if (pid === this.pmtPid && pusi) this.pmt = Buffer.from(p);
+      if (this.vpid < 0 && pusi && pl.length > 3 && pl[0] === 0 && pl[1] === 0 && pl[2] === 1 && (pl[3] & 0xf0) === 0xe0) this.vpid = pid;
+      if (pid === this.vpid && pusi) {
+        const ok = this.held.length && (TsGate.hasIdr(Buffer.concat(this.parts)) || (this.reason = this.skipped > GATE_MAX_SKIP ? 'no IDR, forced' : ''));
+        if (ok) {
+          this.open = true; this.reason = this.reason || 'IDR';
+          if (this.pat) out.push(this.pat); if (this.pmt) out.push(this.pmt);
+          for (const h of this.held) out.push(h); out.push(Buffer.from(p));
+          this.held = []; this.parts = []; next = o + 188;
+        } else { this.skipped += this.held.length * 188; this.held = [Buffer.from(p)]; this.parts = [pl]; }
+      } else if (this.held.length) { this.held.push(Buffer.from(p)); if (pid === this.vpid) this.parts.push(pl); }
+      else this.skipped += 188;
+    }
+    if (next >= 0 && next < chunk.length) out.push(chunk.subarray(next));
+    return out.length ? Buffer.concat(out) : null;
+  }
+}
+
 const LIVE_TS = /\/live\/[^/]+\/[^/]+\/\d+\.ts$/i;
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 async function pumpLive(res, first, target, hd, signal, tx) {
@@ -109,22 +157,25 @@ async function pumpLive(res, first, target, hd, signal, tx) {
   let out = res, ff = null;
   if (tx) {
     const { spawn } = require('child_process');
-    ff = spawn('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-fflags', '+genpts+discardcorrupt', '-probesize', '1000000', '-analyzeduration', '1500000',
+    ff = spawn('ffmpeg', ['-hide_banner', '-loglevel', 'warning', '-fflags', '+genpts+discardcorrupt', '-probesize', '1000000', '-analyzeduration', '1500000',
       '-i', 'pipe:0', '-map', '0:v:0?', '-map', '0:a:0?', '-c:v', 'copy', '-c:a', 'aac', '-b:a', '128k', '-ac', '2',
       '-f', 'mpegts', '-muxdelay', '0', '-flush_packets', '1', 'pipe:1'], { stdio: ['pipe', 'pipe', 'pipe'] });
     out = ff.stdin;
     ff.stdin.on('error', () => {});
     ff.stderr.on('data', d => console.log('[ffmpeg] ' + String(d).trim().slice(0, 400)));
     console.log('[ffmpeg] started audio conversion for ' + maskUrl(target));
-    ff.stdout.on('data', c => { if (!res.write(c)) { ff.stdout.pause(); res.once('drain', () => ff.stdout.resume()); } });
+    let ffOut = 0; const ffT0 = Date.now();
+    ff.stdout.on('data', c => { if (!ffOut) console.log('[ffmpeg] first output after ' + (Date.now() - ffT0) + 'ms'); ffOut += c.length; if (!res.write(c)) { ff.stdout.pause(); res.once('drain', () => ff.stdout.resume()); } });
     ff.on('error', e => { console.log('[ffmpeg] cannot start: ' + e.message); res.end(); });
-    ff.on('close', (code, sig) => { console.log('[ffmpeg] exited code=' + code + ' signal=' + sig); if (!res.writableEnded) res.end(); });
+    ff.on('close', (code, sig) => { console.log('[ffmpeg] exited code=' + code + ' signal=' + sig + ' output=' + Math.round(ffOut / 1024) + ' KB'); if (!res.writableEnded) res.end(); });
     res.on('close', () => { try { ff.kill('SIGKILL'); } catch {} });
   }
   const host = (() => { try { return new URL(target).host; } catch { return '?'; } })();
   const headers = { ...hd }; delete headers.Range;
   let r = first, quick = 0, reconnects = 0, lastUrl = first.finalUrl, cachedOk = true, usedCached = false, lastMs = 0;
+  const gate = new TsGate(); let wasOpen = false;
   for (;;) {
+    gate.reset(); wasOpen = false;
     const t0 = Date.now(); let got = 0, carry = Buffer.alloc(0), why = 'end';
     await new Promise(resolve => {
       r.on('data', c => {
@@ -132,7 +183,9 @@ async function pumpLive(res, first, target, hd, signal, tx) {
         const buf = carry.length ? Buffer.concat([carry, c]) : c;
         const n = buf.length - (buf.length % 188);
         carry = buf.subarray(n);
-        if (n && !out.write(buf.subarray(0, n))) { r.pause(); out.once('drain', () => r.resume()); }
+        const piece = n ? (IDR_GATE ? gate.feed(buf.subarray(0, n)) : buf.subarray(0, n)) : null;
+        if (IDR_GATE && !wasOpen && gate.open) { wasOpen = true; console.log('[live] started on keyframe (' + gate.reason + '), skipped ' + Math.round(gate.skipped / 1024) + ' KB'); }
+        if (piece && piece.length && !out.write(piece)) { r.pause(); out.once('drain', () => r.resume()); }
       });
       r.on('end', resolve);
       r.on('error', e => { why = 'error: ' + e.message; resolve(); });
