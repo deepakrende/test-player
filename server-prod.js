@@ -180,17 +180,26 @@ async function pumpLive(res, first, target, hd, signal, tx) {
   let out = res, ff = null;
   if (tx) {
     const { spawn } = require('child_process');
-    const common = ['-hide_banner', '-loglevel', 'warning', '-fflags', '+genpts+discardcorrupt', '-probesize', '1000000', '-analyzeduration', '1500000', '-i', 'pipe:0', '-map', '0:v:0?', '-map', '0:a:0?'];
-    const tail = ['-c:a', 'aac', '-b:a', '128k', '-ac', '2', '-f', 'mpegts', '-muxdelay', '0', '-flush_packets', '1', 'pipe:1'];
-    // tx=1: copy video, convert audio.  tx=2 (repair): decode with error concealment, deinterlace, re-encode to <=720p H.264 so a damaged/interlaced source plays in Chrome. Needs real CPU (~0.5 core).
-    const vargs = tx === 2
-      ? ['-vf', "yadif=0:-1:1,scale=-2:'min(720,ih)'", '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'zerolatency', '-profile:v', 'main', '-pix_fmt', 'yuv420p', '-crf', '27', '-maxrate', '3500k', '-bufsize', '3500k', '-g', '50', '-sc_threshold', '0', '-af', 'aresample=async=1:first_pts=0']
-      : ['-c:v', 'copy'];
+    const RQ = (process.env.REPAIR_QUALITY || 'fast').toLowerCase();
+    const pre = ['-hide_banner', '-loglevel', 'warning', '-fflags', '+genpts+discardcorrupt', '-probesize', '1000000', '-analyzeduration', '1500000'];
+    const inMap = ['-i', 'pipe:0', '-map', '0:v:0?', '-map', '0:a:0?'];
+    const tail = ['-c:a', 'aac', '-b:a', tx === 2 ? '96k' : '128k', '-ac', '2', '-f', 'mpegts', '-muxdelay', '0', '-flush_packets', '1', 'pipe:1'];
+    const x264 = ['-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'zerolatency', '-profile:v', 'main', '-pix_fmt', 'yuv420p', '-crf', '27', '-g', '50', '-sc_threshold', '0', '-af', 'aresample=async=1:first_pts=0'];
+    // tx=1: copy video, convert audio.
+    // tx=2 (repair): conceal damage, deinterlace, re-encode so a damaged/interlaced source plays in Chrome. CPU per 29 s of 1080i video (measured): fast 0.21 core, safe 0.32, hq 0.42.
+    //   fast (default): skips the deblocking filter and keeps one field (540p; correct for interlaced sources, halves vertical detail of progressive ones)
+    //   safe: same but a real deinterlacer (only touches interlaced frames), 540p        hq: full deinterlace, 720p, deblocking on
+    let before = [], vargs;
+    if (tx !== 2) vargs = ['-c:v', 'copy'];
+    else if (RQ === 'hq') vargs = ['-vf', "yadif=0:-1:1,scale=-2:'min(720,ih)'", ...x264, '-maxrate', '3500k', '-bufsize', '3500k'];
+    else if (RQ === 'safe') { before = ['-skip_loop_filter', 'all']; vargs = ['-vf', "yadif=0:-1:1,scale=-2:'min(540,ih)':flags=fast_bilinear", ...x264, '-maxrate', '2500k', '-bufsize', '2500k']; }
+    else { before = ['-skip_loop_filter', 'all']; vargs = ['-vf', 'field=top,scale=960:540:flags=fast_bilinear', ...x264, '-maxrate', '2500k', '-bufsize', '2500k']; }
+    const common = [...pre, ...before, ...inMap];
     ff = spawn('ffmpeg', [...common, ...vargs, ...tail], { stdio: ['pipe', 'pipe', 'pipe'] });
     out = ff.stdin;
     ff.stdin.on('error', () => {});
     let errLines = 0, errSupp = 0; ff.stderr.on('data', d => { if (errLines < 6) { errLines++; console.log('[ffmpeg] ' + String(d).trim().slice(0, 300)); } else errSupp++; });
-    console.log('[ffmpeg] started ' + (tx === 2 ? 'REPAIR re-encode (deinterlace + 720p)' : 'audio conversion') + ' for ' + maskUrl(target));
+    console.log('[ffmpeg] started ' + (tx === 2 ? 'REPAIR re-encode (' + RQ + ')' : 'audio conversion') + ' for ' + maskUrl(target));
     let ffOut = 0; const ffT0 = Date.now();
     ff.stdout.on('data', c => { if (!ffOut) console.log('[ffmpeg] first output after ' + (Date.now() - ffT0) + 'ms'); ffOut += c.length; if (!res.write(c)) { ff.stdout.pause(); res.once('drain', () => ff.stdout.resume()); } });
     ff.on('error', e => { console.log('[ffmpeg] cannot start: ' + e.message); res.end(); });
